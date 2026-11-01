@@ -11,16 +11,37 @@ install a virtual HID device or forward arbitrary USB/HID reports.
 
 ## 1. VPS
 
-Copy `relay.py` and `protocol.py` into the same folder on your Linux VPS:
+Copy `vps.sh`, `relay.py`, and `protocol.py` into the same folder on your Linux VPS
+(or clone this repository), then run:
 
 ```sh
-python3 relay.py --port 5000
+bash vps.sh start --port 5000
+bash vps.sh status
+bash vps.sh stop
 ```
 
 The relay listens on `0.0.0.0`. Allow inbound **TCP port 5000** in your VPS
-provider's firewall and the server firewall. Keep the process running while
-sharing. You can use a different port with `--port` or bind a particular
-interface with `--host`.
+provider's firewall and the server firewall. The script runs it in the
+background and keeps it running after you disconnect from SSH. No root access
+is needed. It requires Bash and `flock` (usually provided by `util-linux`).
+
+Use these commands to restart with different options and follow the log:
+
+```sh
+bash vps.sh restart --host 0.0.0.0 --port 5000
+tail -f .run/relay.log
+```
+
+`start` defaults to port 5000 and does nothing if the managed relay is already
+running. Pass your options again on each restart; they are not saved. Logs
+append to `.run/relay.log`; the PID and lock also live in `.run/`, which Git
+ignores. Use the same Linux account for all commands. The script can be invoked
+from any directory and manages only the process it launched. It does not
+configure automatic startup after a VPS reboot. Set `PYTHON=/path/to/python3`
+if you need a particular interpreter. `status` returns exit code 1 if stopped.
+
+For foreground operation, `python3 relay.py --port 5000` is still available;
+stop that process with Ctrl+C rather than `vps.sh stop`.
 
 As requested, this prototype has no authentication or encryption. Anyone who
 can reach its listening port can publish or subscribe to a mouse stream.
