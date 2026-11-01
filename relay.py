@@ -1,108 +1,104 @@
-"""Run on the Linux VPS: python3 relay.py --port 5000."""
+"""Linux VPS rendezvous/byte relay for real USB/IP devices (no USB drivers here)."""
 import argparse
 import asyncio
-from dataclasses import dataclass, field
-import socket
+from dataclasses import dataclass
 import uuid
 
-from protocol import MAX_LINE, TIMEOUT, decode, encode, mouse_event, state_event
+from protocol import VERSION, MAX_LINE, bridge, bus_id, close, receive, send, tune
 
 
 @dataclass
 class Source:
     name: str
-    buttons: int = 0
-    listeners: set = field(default_factory=set)
+    busid: str
+    writer: object
+    active: object = None
 
 
 class Relay:
     def __init__(self):
         self.sources = {}
-
-    async def read(self, reader, timeout=TIMEOUT):
-        return decode(await asyncio.wait_for(reader.readline(), timeout))
-
-    async def write(self, writer, message):
-        writer.write(encode(message))
-        await asyncio.wait_for(writer.drain(), 2)
-
-    def publish(self, source, message):
-        for queue in tuple(source.listeners):
-            if queue.full():
-                # Never silently discard a button release or replay stale motion.
-                source.listeners.discard(queue)
-                while not queue.empty():
-                    queue.get_nowait()
-                queue.put_nowait({"type": "error", "message": "Destination too slow; reconnect"})
-            else:
-                queue.put_nowait(message)
+        self.pending = {}
 
     async def handle(self, reader, writer):
         source_id = None
-        subscription = None
-        queue = None
+        raw = False
         try:
-            writer.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            hello = await self.read(reader)
-            if hello["type"] == "source":
+            tune(writer)
+            hello = await receive(reader)
+            if hello.get("version") != VERSION:
+                raise ValueError("Protocol changed: update the VPS and both Windows clients")
+            role = hello["type"]
+            if role == "source":
                 name = hello.get("name")
                 if not isinstance(name, str) or not 1 <= len(name) <= 256 or not name.isprintable():
                     raise ValueError("Invalid source name")
+                if len(self.sources) >= 32:
+                    raise ValueError("Relay source limit reached")
+                source = Source(name, bus_id(hello.get("busid")), writer)
                 source_id = uuid.uuid4().hex
-                source = Source(name)
                 self.sources[source_id] = source
-                await self.write(writer, {"type": "registered", "id": source_id})
-                print(f"Source connected: {name}", flush=True)
+                await send(writer, {"type": "registered", "id": source_id})
+                print(f"USB source connected: {name} [{source.busid}]", flush=True)
                 while True:
-                    event = await self.read(reader)
-                    if event["type"] == "ping":
-                        continue
-                    event = mouse_event(event)
-                    source.buttons = event["buttons"]
-                    self.publish(source, event)
-            elif hello["type"] == "destination":
-                await self.write(writer, {"type": "sources", "sources": [
-                    {"id": key, "name": value.name} for key, value in self.sources.items()]})
-                # Allow time for a person to choose from the printed list.
-                request = await self.read(reader, timeout=300)
-                source_id_requested = request.get("id")
-                if request["type"] != "subscribe" or not isinstance(source_id_requested, str):
-                    raise ValueError("Expected a source selection")
-                subscription = self.sources.get(source_id_requested)
-                if subscription is None:
-                    raise ValueError("Source is no longer available; reconnect")
-                queue = asyncio.Queue(maxsize=2048)
-                subscription.listeners.add(queue)
-                queue.put_nowait(state_event(subscription.buttons))
-                await self.write(writer, {"type": "subscribed", "name": subscription.name})
-                while True:
-                    try:
-                        message = await asyncio.wait_for(queue.get(), 1)
-                    except asyncio.TimeoutError:
-                        message = {"type": "ping"}
-                    await self.write(writer, message)
-                    if message["type"] in ("offline", "error"):
-                        break
+                    message = await receive(reader)
+                    if message["type"] != "ping":
+                        raise ValueError("Expected source heartbeat")
+                    await send(writer, {"type": "pong"})
+            elif role == "list":
+                await send(writer, {"type": "sources", "sources": [
+                    {"id": key, "name": item.name, "busid": item.busid,
+                     "busy": item.active is not None} for key, item in self.sources.items()]})
+            elif role == "connect":
+                selected = hello.get("id")
+                if not isinstance(selected, str) or selected not in self.sources:
+                    raise ValueError("USB source is no longer available")
+                source = self.sources[selected]
+                if source.active is not None:
+                    raise ValueError("USB device is already in use by a destination")
+                source.active = asyncio.current_task()
+                token = uuid.uuid4().hex
+                future = asyncio.get_running_loop().create_future()
+                complete = asyncio.Event()
+                self.pending[token] = (future, complete)
+                try:
+                    await send(source.writer, {"type": "open", "token": token})
+                    remote_reader, remote_writer = await asyncio.wait_for(future, 10)
+                    await send(writer, {"type": "ready"})
+                    raw = True
+                    await bridge(reader, writer, remote_reader, remote_writer)
+                finally:
+                    self.pending.pop(token, None)
+                    complete.set()
+                    source.active = None
+            elif role == "channel":
+                token = hello.get("token")
+                pending = self.pending.get(token) if isinstance(token, str) else None
+                if pending is None or pending[0].done():
+                    raise ValueError("Unknown or expired tunnel channel")
+                future, complete = pending
+                await send(writer, {"type": "ready"})
+                raw = True
+                # The connect handler owns all subsequent reads on this stream.
+                if not future.done():
+                    future.set_result((reader, writer))
+                    await complete.wait()
             else:
-                raise ValueError("Expected source or destination greeting")
-        except (OSError, ValueError, ConnectionError, asyncio.TimeoutError) as exc:
-            try:
-                await self.write(writer, {"type": "error", "message": str(exc) or "Connection timed out"})
-            except (OSError, asyncio.TimeoutError):
-                pass
+                raise ValueError("Unknown connection role")
+        except (OSError, ValueError, asyncio.TimeoutError) as exc:
+            if not raw:
+                try:
+                    await send(writer, {"type": "error", "message": str(exc) or "Connection timed out"})
+                except (OSError, asyncio.TimeoutError):
+                    pass
         finally:
             if source_id is not None:
                 source = self.sources.pop(source_id, None)
                 if source:
-                    self.publish(source, {"type": "offline"})
-                    print(f"Source disconnected: {source.name}", flush=True)
-            if subscription is not None and queue is not None:
-                subscription.listeners.discard(queue)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+                    if source.active is not None:
+                        source.active.cancel()
+                    print(f"USB source disconnected: {source.name}", flush=True)
+            await close(writer)
 
 
 async def serve(host, port):
@@ -115,7 +111,7 @@ async def serve(host, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="0.0.0.0", help="Address to listen on")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=5000)
     args = parser.parse_args()
     try:

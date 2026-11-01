@@ -1,134 +1,186 @@
-# Remote mouse through a VPS
+# Physical USB mouse forwarding through a VPS
 
-Three Python programs share one selected Windows mouse through a Linux VPS.
-Both Windows computers make outbound TCP connections to the VPS. Python 3.10+
-is required; there are no third-party dependencies.
+This version forwards a **real USB device using USB/IP**. The Desktop's USB
+driver exports the selected physical mouse or receiver, and the Surface's
+virtual USB controller attaches that device to Windows. Python carries USB/IP
+traffic through the Linux VPS. There is no Raw Input capture or SendInput replay.
 
-The source uses Windows Raw Input to distinguish physical mice. The destination
-replays movement, five mouse buttons, and vertical/horizontal scrolling using
-Windows SendInput. This controls the normal Windows cursor; it does **not**
-install a virtual HID device or forward arbitrary USB/HID reports.
+```text
+Desktop mouse -> usbipd-win -> source.py -> VPS relay
+                                             |
+Surface USB controller <- usbip-win2 <- destination.py
+```
 
-## 1. VPS
+Both PCs connect outward to the VPS. One destination can attach a selected
+device at a time. The Desktop loses use of the device while it is attached
+remotely. A combined mouse/keyboard receiver is forwarded as a **whole USB
+device**, including its other functions.
 
-Copy `vps.sh`, `relay.py`, and `protocol.py` into the same folder on your Linux VPS
-(or clone this repository), then run:
+Physical USB mice and USB wireless receivers are supported by this design.
+A Bluetooth mouse or I2C touchpad is not an independently exportable USB mouse.
 
-```sh
+## Requirements
+
+- Python 3.10+ on all machines; no third-party Python packages.
+- Desktop: install [usbipd-win](https://github.com/dorssel/usbipd-win/releases),
+  including its Windows service and driver.
+- Surface: install [usbip-win2](https://github.com/vadimgrn/usbip-win2/releases),
+  including its virtual USB controller driver and `usbip.exe`. Choose the
+  upstream installer for your Windows architecture and follow its restart
+  instructions.
+- Run the Windows clients from an Administrator terminal for driver operations.
+- VPS launcher: Linux, Bash, and `flock` from util-linux.
+
+The scripts do not install drivers or change Windows signing settings. Keep a
+separate local keyboard/touchpad available to stop sharing.
+
+**Update the VPS and both Windows clients together.** The old cursor-replay
+version is incompatible with this USB/IP protocol.
+
+## 1. Linux VPS
+
+Clone the repository, or copy `vps.sh`, `relay.py`, and `protocol.py` into one
+folder. Allow inbound TCP port 5000 in the VPS/provider firewall. Run:
+
+```bash
 bash vps.sh start --port 5000
 bash vps.sh status
 bash vps.sh stop
 ```
 
-The relay listens on `0.0.0.0`. Allow inbound **TCP port 5000** in your VPS
-provider's firewall and the server firewall. The script runs it in the
-background and keeps it running after you disconnect from SSH. No root access
-is needed. It requires Bash and `flock` (usually provided by `util-linux`).
+For an existing checkout, update and restart:
 
-Use these commands to restart with different options and follow the log:
-
-```sh
-bash vps.sh restart --host 0.0.0.0 --port 5000
+```bash
+git pull
+bash vps.sh restart --port 5000
 tail -f .run/relay.log
 ```
 
-`start` defaults to port 5000 and does nothing if the managed relay is already
-running. Pass your options again on each restart; they are not saved. Logs
-append to `.run/relay.log`; the PID and lock also live in `.run/`, which Git
-ignores. Use the same Linux account for all commands. The script can be invoked
-from any directory and manages only the process it launched. It does not
-configure automatic startup after a VPS reboot. Set `PYTHON=/path/to/python3`
-if you need a particular interpreter. `status` returns exit code 1 if stopped.
+The default listen address is `0.0.0.0`; override it with `--host` on start or
+restart. Custom options must be passed again on restart. The relay runs after
+SSH disconnects but does not automatically start after a VPS reboot. Use the
+same Linux account for start/stop. PID, lock, and appended log files live under
+`.run/`, excluded from Git. `status` exits with code 1 when stopped.
+Set `PYTHON=/path/to/python3` to choose an interpreter.
 
-For foreground operation, `python3 relay.py --port 5000` is still available;
-stop that process with Ctrl+C rather than `vps.sh stop`.
+Foreground operation is also available with `python3 relay.py --port 5000`;
+stop it with Ctrl+C. The launcher manages only the process it started.
 
-As requested, this prototype has no authentication or encryption. Anyone who
-can reach its listening port can publish or subscribe to a mouse stream.
+As requested, there is no authentication or encryption. Anyone who can reach
+the relay can discover and attempt to attach advertised USB devices.
 
-## 2. Desktop (source)
+## 2. Desktop: choose the physical mouse
 
-Keep `source.py`, `winmouse.py`, and `protocol.py` in the same folder:
+Keep the complete repository on the Desktop, or at least `source.py`,
+`protocol.py`, `usb_backend.py`, and `usb_tunnel.py`. After installing usbipd-win,
+open Administrator PowerShell:
 
 ```powershell
 python source.py
 ```
 
-Choose a numbered local mouse, then enter the VPS IP and port:
-
 ```text
-Available local mouse devices:
-[1] HID-compliant mouse
-    \\?\HID#VID_... (device path distinguishes identical names)
-Select mouse: 1
-VPS IP address: 203.0.113.10
+Available physical USB mice/receivers:
+[1] USB Optical Mouse (USB bus 1-3)
+    USB\VID_...\...
+Select device: 1
+VPS IP address: YOUR_VPS_IP
 VPS port [5000]: 5000
 ```
 
-Use your real VPS address; the address above is an example. Only events from
-the selected device are forwarded. The selected mouse **also continues to
-control the Desktop locally**. Release its buttons before starting capture.
+Mouse PnP devices are matched to their exact physical USB ancestors. The bus
+ID and instance path distinguish identical mice. The program binds only the
+selected device with usbipd and registers it at the VPS.
 
-## 3. Surface (destination)
+If a receiver is not identified as a mouse:
 
-Keep `destination.py`, `winmouse.py`, and `protocol.py` in the same folder:
+```powershell
+python source.py --all-usb
+```
+
+If usbipd says the device needs forced binding, stop sharing, unbind the device
+if already shared, then opt into forced binding:
+
+```powershell
+usbipd unbind --busid 1-3
+python source.py --all-usb --force
+```
+
+Replace `1-3` with the selected device's bus ID. Forced binding replaces its
+local driver and may make it unavailable locally before a destination attaches.
+Already-shared devices are otherwise left bound. The program only undoes
+bindings created during its current run.
+
+usbipd must be running locally on port 3240. No router port forwarding or VPS
+port 3240 is needed. The source connects to usbipd on loopback and permits
+imports only for the selected bus ID.
+
+Optional arguments:
+
+```powershell
+python source.py --host YOUR_VPS_IP --port 5000
+python source.py --usbipd "C:\Program Files\usbipd-win\usbipd.exe"
+```
+
+## 3. Surface: attach the USB device
+
+Keep the complete repository on the Surface, or `destination.py`, `protocol.py`,
+and `usb_backend.py`. After installing usbip-win2, open Administrator PowerShell:
 
 ```powershell
 python destination.py
 ```
 
 ```text
-VPS IP address: 203.0.113.10
+VPS IP address: YOUR_VPS_IP
 VPS port [5000]: 5000
-Available remote mice:
-[1] DESKTOP / HID-compliant mouse
-Select mouse: 1
-Connected to DESKTOP / HID-compliant mouse.
+Available remote physical USB devices:
+[1] DESKTOP / USB Optical Mouse (USB bus 1-3)
+Select device: 1
+Physical USB device attached on Windows USB/IP port 1: DESKTOP / USB Optical Mouse
 ```
 
-Start the source before selecting it on the Surface. For repeated use, either
-Windows client also accepts `--host YOUR_VPS_IP --port 5000`; mouse selection
-remains interactive. Multiple sources and destinations are supported.
+The program creates a loopback proxy and invokes `usbip attach`. Windows
+attaches the device through the installed USB/IP controller driver; Python
+forwards its USB/IP traffic. Its HID functions should enumerate in Windows
+instead of being simulated by this application.
 
-## Stopping and reconnecting
+Optional arguments:
 
-Press **Ctrl+Alt+F12** on the respective Windows computer, or **Ctrl+C** in its
-console. The destination releases remotely held buttons when it exits, loses
-the connection, or receives a source-disconnected message. An interrupted
-network connection is detected after approximately six seconds of inactivity;
-if only the source loses connectivity, allow additional relay delivery time.
-Rerun a client to reconnect or refresh the device list. Unplugging the chosen
-source mouse stops sharing; select it again after reconnecting it.
-
-## Behavior and limits
-
-- Input is streamed as events, not polled from a latest-state variable.
-  Each event carries the full button state, and a new subscriber receives
-  the current button state immediately.
-- TCP preserves order. Network latency and retransmissions can still cause
-  lag. A full application queue disconnects rather than dropping button
-  changes or retaining an unbounded backlog.
-- Source and destination pointer speed settings may make movement feel
-  different. Absolute mouse coordinates are supported, but this is not
-  screen sharing or cursor-position synchronization.
-- Windows may block SendInput into elevated applications. If that is needed,
-  run the destination at the corresponding privilege level. UAC secure
-  desktop/login control and hardware-only input consumers are outside scope.
-- USB receivers, touchpads, and virtual input devices may expose generic names
-  or combine physical devices. Selection follows the devices Windows exposes
-  through Raw Input; the full device path is printed to distinguish them.
-- Avoid subscribing on the source computer itself; this prototype is intended
-  for two separate Windows computers.
-
-## Validation
-
-```sh
-python -m unittest discover -s tests -v
+```powershell
+python destination.py --host YOUR_VPS_IP --port 5000
+python destination.py --usbip "C:\Program Files\USBip\usbip.exe"
 ```
 
-The tests exercise real local TCP relay connections, source selection,
-multiple subscribers, button synchronization, disconnects, invalid input,
-queue overflow, and Windows input translation with injection mocked out.
-Actual mouse behavior across your VPS and two PCs needs a hardware check:
-move each mouse to verify selection, test clicks/drag/scroll, stop the source
-while holding a button, and check the local stop shortcut on the destination.
+Start the Desktop source first. Busy devices are omitted from selection. Keep
+both clients running while using the device.
+
+## Stop and reconnect
+
+Press **Ctrl+C in either client's terminal**. There is no global Ctrl+Alt+F12
+shortcut in this version. The destination closes its tunnel and detaches its
+specific USB/IP port. The source closes its channels and undoes sharing only
+if it created the binding.
+
+A crash or broken network may require manual cleanup:
+
+```powershell
+# Surface: inspect ports, then detach only the affected port.
+usbip port
+usbip detach -p 1
+
+# Desktop: undo sharing for the chosen bus ID if needed.
+usbipd unbind --busid 1-3
+```
+
+Use your actual port/bus ID. Rerun clients to reconnect or refresh their lists.
+Control heartbeats detect a silent source connection after roughly ten seconds;
+native driver recovery time may vary.
+
+## Validation status
+
+This USB/IP revision has not been verified with physical hardware. Simulated
+device tests were intentionally skipped; hardware validation is left to the
+user. Obsolete event-replay tests were removed with that implementation.
+The remaining `tests/test_vps_script.py` checks only the Linux launcher's
+lifecycle, not USB driver behavior or mouse attachment.

@@ -1,72 +1,110 @@
-"""Choose a local Windows mouse and forward its input to the VPS."""
+"""Export one physical USB mouse through a reverse tunnel to the VPS."""
 import argparse
-import os
-import queue
+import asyncio
 import socket
-import threading
+import subprocess
+import sys
 
-from protocol import Connection, choose, endpoint
+from protocol import VERSION, choose, close, connect, endpoint, receive, send
+from usb_backend import command, list_devices, require_windows, tool
+from usb_tunnel import forward_device
+
+
+async def share(host, port, device, usb_port=3240, on_registered=None):
+    reader, writer = await connect(host, port)
+    channels = set()
+    heartbeat = None
+
+    async def channel(token):
+        channel_writer = None
+        try:
+            channel_reader, channel_writer = await connect(host, port)
+            await send(channel_writer, {"type": "channel", "version": VERSION, "token": token})
+            if (await receive(channel_reader))["type"] != "ready":
+                raise ValueError("Unexpected relay channel response")
+            await forward_device(channel_reader, channel_writer, device["busid"], usb_port=usb_port)
+        except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
+            print(f"USB tunnel closed: {exc}", file=sys.stderr)
+        finally:
+            await close(channel_writer)
+
+    async def ping():
+        try:
+            while True:
+                await send(writer, {"type": "ping"})
+                await asyncio.sleep(2)
+        except OSError:
+            writer.close()
+
+    try:
+        name = f"{socket.gethostname()} / {device['name']}"[:256]
+        await send(writer, {"type": "source", "version": VERSION, "name": name, "busid": device["busid"]})
+        response = await receive(reader)
+        if response["type"] != "registered":
+            raise ValueError("Unexpected relay response")
+        if on_registered:
+            on_registered(response["id"])
+        print(f"Sharing physical USB device {device['name']} [{device['busid']}] through {host}:{port}.")
+        print("Keep this window open. Ctrl+C stops forwarding and returns the device.")
+        heartbeat = asyncio.create_task(ping())
+        while True:
+            message = await receive(reader)
+            if message["type"] == "pong":
+                continue
+            if message["type"] != "open" or not isinstance(message.get("token"), str):
+                raise ValueError("Unexpected relay command")
+            task = asyncio.create_task(channel(message["token"]))
+            channels.add(task)
+            task.add_done_callback(channels.discard)
+    finally:
+        if heartbeat:
+            heartbeat.cancel()
+        for task in tuple(channels):
+            task.cancel()
+        await asyncio.gather(*(list(channels) + ([heartbeat] if heartbeat else [])), return_exceptions=True)
+        await close(writer)
 
 
 def run(args):
-    if os.name != "nt":
-        raise ValueError("The source requires Windows")
-    from winmouse import capture, list_mice
-    print("Available local mouse devices:")
-    device = choose(list_mice(), "mouse devices")
+    require_windows()
+    usbipd = tool("usbipd", args.usbipd)
+    print("Available physical USB mice/receivers:" if not args.all_usb else "Available physical USB devices:")
+    print("The entire selected USB device is handed over to the Surface while attached.")
+    devices = list_devices(usbipd, args.all_usb)
+    device = choose(devices, "USB mice (use --all-usb to list receivers not identified as mice)")
+    if device["attached"]:
+        raise ValueError("This device is already attached to another USB/IP client")
     host, port = endpoint(args)
-    connection = Connection(host, port)
-    stop = threading.Event()
-    events = queue.Queue(maxsize=4096)
-    errors = []
-    worker = None
+    bound_here = False
     try:
-        connection.send({"type": "source", "name": f"{socket.gethostname()} / {device['name']}"[:256]})
-        if connection.receive()["type"] != "registered":
-            raise ValueError("Unexpected relay response")
-
-        def send_events():
-            try:
-                while not stop.is_set():
-                    try:
-                        event = events.get(timeout=1)
-                    except queue.Empty:
-                        event = {"type": "ping"}
-                    connection.send(event)
-            except (OSError, ValueError) as exc:
-                errors.append(exc)
-                stop.set()
-
-        def emit(event):
-            try:
-                events.put_nowait(event)
-            except queue.Full:
-                raise ConnectionError("Network cannot keep up with the mouse; forwarding stopped")
-
-        worker = threading.Thread(target=send_events, daemon=True)
-        worker.start()
-        print(f"Sharing {device['name']} through {host}:{port}.")
-        print("Press Ctrl+Alt+F12 anywhere or Ctrl+C in this console to stop.")
-        capture(device["handle"], emit, stop)
-        if errors:
-            raise errors[0]
+        if not device["shared"]:
+            print(f"Sharing USB bus {device['busid']} with usbipd (requires Administrator).")
+            options = ["--force"] if args.force else []
+            command(usbipd, "bind", "--busid", device["busid"], *options)
+            bound_here = True
+        asyncio.run(share(host, port, device, args.usbipd_port))
     finally:
-        stop.set()
-        connection.close()
-        if worker:
-            worker.join(timeout=2)
+        if bound_here:
+            try:
+                command(usbipd, "unbind", "--busid", device["busid"])
+            except (OSError, subprocess.SubprocessError) as exc:
+                print(f"Could not undo sharing: {exc}\nRun: usbipd unbind --busid {device['busid']}", file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", help="VPS IP address; prompted when omitted")
     parser.add_argument("--port", type=int, help="VPS TCP port; prompted when omitted")
+    parser.add_argument("--usbipd", help="Path to usbipd.exe")
+    parser.add_argument("--usbipd-port", type=int, default=3240, help="Local usbipd TCP port")
+    parser.add_argument("--all-usb", action="store_true", help="Show all USB devices, including unidentified receivers")
+    parser.add_argument("--force", action="store_true", help="Use usbipd bind --force; replaces the device's local driver while shared")
     args = parser.parse_args()
     try:
         run(args)
     except (KeyboardInterrupt, EOFError):
-        print("\nSharing stopped.")
-    except (OSError, ValueError) as exc:
+        print("\nUSB forwarding stopped.")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"Source error: {exc}\n")
 
 
