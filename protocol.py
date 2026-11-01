@@ -18,7 +18,10 @@ def encode(message):
 
 
 async def receive(reader, timeout=TIMEOUT):
-    data = await asyncio.wait_for(reader.readline(), timeout)
+    try:
+        data = await asyncio.wait_for(reader.readline(), timeout)
+    except asyncio.TimeoutError as exc:
+        raise ConnectionError(f"No control reply received within {timeout} seconds; the connection stalled or the relay is not responding") from exc
     if not data:
         raise ConnectionError("Connection closed")
     if len(data) > MAX_LINE or not data.endswith(b"\n"):
@@ -43,10 +46,30 @@ def tune(writer):
 
 
 async def connect(host, port):
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, port, limit=MAX_LINE), TIMEOUT)
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, limit=MAX_LINE), TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        raise ConnectionError(f"Timed out connecting to {host}:{port} after {TIMEOUT} seconds; check the address, relay status, and TCP firewall rules") from exc
+    except ConnectionRefusedError as exc:
+        raise ConnectionError(f"Connection refused by {host}:{port}; check that the relay is listening on this port") from exc
+    except socket.gaierror as exc:
+        raise ConnectionError(f"Cannot resolve host {host!r}: {exc}") from exc
     tune(writer)
     return reader, writer
+
+
+async def check_relay(host, port):
+    """Check the real relay protocol without sharing or attaching a device."""
+    reader, writer = await connect(host, port)
+    try:
+        await send(writer, {"type": "list", "version": VERSION})
+        response = await receive(reader)
+        if response["type"] != "sources":
+            raise ValueError("This endpoint is not a compatible USB/IP relay; update and restart the VPS")
+        return response
+    finally:
+        await close(writer)
 
 
 async def close(writer):

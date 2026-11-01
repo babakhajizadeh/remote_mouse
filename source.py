@@ -4,13 +4,15 @@ import asyncio
 import socket
 import subprocess
 import sys
+import traceback
 
-from protocol import VERSION, choose, close, connect, endpoint, receive, send
+from protocol import VERSION, check_relay, choose, close, connect, endpoint, receive, send
 from usb_backend import command, list_devices, require_windows, tool
 from usb_tunnel import forward_device
 
 
 async def share(host, port, device, usb_port=3240, on_registered=None):
+    print(f"Connecting to VPS {host}:{port}...", flush=True)
     reader, writer = await connect(host, port)
     channels = set()
     heartbeat = None
@@ -75,6 +77,9 @@ def run(args):
     if device["attached"]:
         raise ValueError("This device is already attached to another USB/IP client")
     host, port = endpoint(args)
+    print(f"Checking VPS relay at {host}:{port} before sharing the device...", flush=True)
+    asyncio.run(check_relay(host, port))
+    print("VPS relay is reachable and compatible.", flush=True)
     bound_here = False
     try:
         if not device["shared"]:
@@ -99,13 +104,16 @@ def main():
     parser.add_argument("--usbipd-port", type=int, default=3240, help="Local usbipd TCP port")
     parser.add_argument("--all-usb", action="store_true", help="Show all USB devices, including unidentified receivers")
     parser.add_argument("--force", action="store_true", help="Use usbipd bind --force; replaces the device's local driver while shared")
+    parser.add_argument("--debug", action="store_true", help="Include the full traceback when an error occurs")
     args = parser.parse_args()
     try:
         run(args)
     except (KeyboardInterrupt, EOFError):
         print("\nUSB forwarding stopped.")
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        parser.exit(1, f"Source error: {exc}\n")
+    except (OSError, ValueError, subprocess.SubprocessError, asyncio.TimeoutError) as exc:
+        if args.debug:
+            traceback.print_exc()
+        parser.exit(1, f"Source error: {str(exc) or type(exc).__name__}\n")
 
 
 if __name__ == "__main__":

@@ -177,6 +177,33 @@ Use your actual port/bus ID. Rerun clients to reconnect or refresh their lists.
 Control heartbeats detect a silent source connection after roughly ten seconds;
 native driver recovery time may vary.
 
+## Troubleshooting a source connection error
+
+The source checks the VPS connection and protocol before binding a USB device.
+A connection timeout means the TCP connection did not complete; check the VPS
+listen address, server/provider firewall, and the route from the Desktop.
+The VPS must listen on a reachable interface, not only `127.0.0.1`.
+
+Run these inside the VPS repository:
+
+```bash
+bash vps.sh status
+ss -ltnp 'sport = :5000'
+tail -n 30 .run/relay.log
+```
+
+If the relay is stopped or using an old version:
+
+```bash
+git pull
+bash vps.sh restart --host 0.0.0.0 --port 5000
+```
+
+Allow inbound TCP 5000 in both the VPS provider firewall and any enabled Linux
+firewall. For a full source traceback, run `python source.py --debug`.
+Older clients could show a blank `Source error:` on timeout; update the Desktop
+checkout with `git pull` to get the descriptive error message.
+
 ## Validation status
 
 This USB/IP revision has not been verified with physical hardware. Simulated
